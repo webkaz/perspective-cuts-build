@@ -156,9 +156,7 @@ jobs:
 
           tag="${{ needs.plan.outputs.upstream_tag }}"
           title="perspective-cuts ${tag}"
-          notes="Build-only release for ${UPSTREAM_REPO} ${tag}.
-
-Upstream release: ${{ needs.plan.outputs.upstream_url }}"
+          notes="Build-only release for ${UPSTREAM_REPO} ${tag}. Upstream release: ${{ needs.plan.outputs.upstream_url }}"
 
           gh release create "${tag}" artifacts/* \
             --target "${GITHUB_SHA}" \
