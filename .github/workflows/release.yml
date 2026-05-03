@@ -9,6 +9,11 @@ on:
         description: "Upstream release tag to build. Leave empty to use the latest upstream release."
         required: false
         type: string
+      force_release:
+        description: "Rebuild and replace assets even if this release already exists."
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -34,6 +39,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           REQUESTED_UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          FORCE_RELEASE: ${{ inputs.force_release }}
         shell: bash
         run: |
           set -euo pipefail
@@ -54,7 +60,10 @@ jobs:
             exit 1
           fi
 
-          if gh release view "${upstream_tag}" >/dev/null 2>&1; then
+          if [[ "${FORCE_RELEASE}" == "true" ]]; then
+            should_build="true"
+            echo "Force release requested for ${upstream_tag}; build required."
+          elif gh release view "${upstream_tag}" >/dev/null 2>&1; then
             should_build="false"
             echo "Release ${upstream_tag} already exists in ${GH_REPO}."
           else
@@ -105,8 +114,9 @@ jobs:
           asset="perspective-cuts-${version}-macos-${{ matrix.asset_arch }}"
           dist="${PWD}/dist/${asset}"
 
-          mkdir -p "${dist}/bin" "${dist}/share/doc/perspective-cuts"
+          mkdir -p "${dist}/bin" "${dist}/Resources" "${dist}/share/doc/perspective-cuts"
           cp "source/.build/release/perspective-cuts" "${dist}/bin/perspective-cuts"
+          cp source/Sources/perspective-cuts/Resources/actions.json "${dist}/Resources/actions.json"
           cp source/LICENSE "${dist}/share/doc/perspective-cuts/LICENSE"
           cp source/README.md "${dist}/share/doc/perspective-cuts/README.md"
           chmod 0755 "${dist}/bin/perspective-cuts"
@@ -158,7 +168,12 @@ jobs:
           title="perspective-cuts ${tag}"
           notes="Build-only release for ${UPSTREAM_REPO} ${tag}. Upstream release: ${{ needs.plan.outputs.upstream_url }}"
 
-          gh release create "${tag}" artifacts/* \
-            --target "${GITHUB_SHA}" \
-            --title "${title}" \
-            --notes "${notes}"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" artifacts/* --clobber
+            gh release edit "${tag}" --target "${GITHUB_SHA}" --title "${title}" --notes "${notes}"
+          else
+            gh release create "${tag}" artifacts/* \
+              --target "${GITHUB_SHA}" \
+              --title "${title}" \
+              --notes "${notes}"
+          fi
