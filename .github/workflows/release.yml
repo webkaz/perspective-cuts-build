@@ -1,31 +1,76 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  schedule:
+    - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
-      version:
-        description: "Release version without the v prefix, for example 0.1.0"
-        required: true
-        type: string
-      upstream_ref:
-        description: "Upstream perspective-cuts git ref to build"
+      upstream_tag:
+        description: "Upstream release tag to build. Leave empty to use the latest upstream release."
         required: false
-        default: "fdfadd8d5fc065114f4350f26e28f4443ddb7932"
         type: string
 
 permissions:
   contents: write
 
 env:
-  UPSTREAM_REPO: "https://github.com/taylorarndt/perspective-cuts.git"
-  UPSTREAM_REF: "fdfadd8d5fc065114f4350f26e28f4443ddb7932"
+  UPSTREAM_REPO: "taylorarndt/perspective-cuts"
+  UPSTREAM_GIT_URL: "https://github.com/taylorarndt/perspective-cuts.git"
 
 jobs:
+  plan:
+    name: Check upstream release
+    runs-on: ubuntu-24.04
+    outputs:
+      should_build: ${{ steps.plan.outputs.should_build }}
+      upstream_tag: ${{ steps.plan.outputs.upstream_tag }}
+      version: ${{ steps.plan.outputs.version }}
+      upstream_url: ${{ steps.plan.outputs.upstream_url }}
+
+    steps:
+      - name: Resolve upstream release
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REQUESTED_UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          requested_tag="${REQUESTED_UPSTREAM_TAG}"
+          if [[ -n "${requested_tag}" ]]; then
+            upstream_json="$(gh release view "${requested_tag}" --repo "${UPSTREAM_REPO}" --json tagName,url)"
+          else
+            upstream_json="$(gh release view --repo "${UPSTREAM_REPO}" --json tagName,url)"
+          fi
+
+          upstream_tag="$(jq -r '.tagName' <<< "${upstream_json}")"
+          upstream_url="$(jq -r '.url' <<< "${upstream_json}")"
+          version="${upstream_tag#v}"
+
+          if [[ -z "${upstream_tag}" || "${upstream_tag}" == "null" ]]; then
+            echo "Unable to resolve upstream release tag" >&2
+            exit 1
+          fi
+
+          if gh release view "${upstream_tag}" >/dev/null 2>&1; then
+            should_build="false"
+            echo "Release ${upstream_tag} already exists in ${GH_REPO}."
+          else
+            should_build="true"
+            echo "Release ${upstream_tag} is missing in ${GH_REPO}; build required."
+          fi
+
+          echo "should_build=${should_build}" >> "${GITHUB_OUTPUT}"
+          echo "upstream_tag=${upstream_tag}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "upstream_url=${upstream_url}" >> "${GITHUB_OUTPUT}"
+
   build:
     name: Build ${{ matrix.asset_arch }}
+    needs: plan
+    if: needs.plan.outputs.should_build == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -37,39 +82,12 @@ jobs:
             asset_arch: arm64
 
     steps:
-      - name: Resolve release inputs
-        id: release
+      - name: Clone upstream release source
         shell: bash
         run: |
           set -euo pipefail
-
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            version="${{ inputs.version }}"
-            upstream_ref="${{ inputs.upstream_ref }}"
-          else
-            version="${GITHUB_REF_NAME#v}"
-            upstream_ref="${UPSTREAM_REF}"
-          fi
-
-          if [[ ! "${version}" =~ ^[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
-            echo "version must look like 0.1.0 or 0.1.0-rc.1" >&2
-            exit 1
-          fi
-
-          if [[ -z "${upstream_ref}" ]]; then
-            echo "upstream_ref must not be empty" >&2
-            exit 1
-          fi
-
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-          echo "upstream_ref=${upstream_ref}" >> "${GITHUB_OUTPUT}"
-
-      - name: Clone upstream source
-        shell: bash
-        run: |
-          set -euo pipefail
-          git clone --filter=blob:none "${UPSTREAM_REPO}" source
-          git -C source checkout --detach "${{ steps.release.outputs.upstream_ref }}"
+          git clone --filter=blob:none "${UPSTREAM_GIT_URL}" source
+          git -C source checkout --detach "${{ needs.plan.outputs.upstream_tag }}"
           git -C source rev-parse HEAD
 
       - name: Build release binary
@@ -83,7 +101,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          version="${{ steps.release.outputs.version }}"
+          version="${{ needs.plan.outputs.version }}"
           asset="perspective-cuts-${version}-macos-${{ matrix.asset_arch }}"
           dist="${PWD}/dist/${asset}"
 
@@ -107,25 +125,13 @@ jobs:
 
   release:
     name: Publish release
-    needs: build
+    needs:
+      - plan
+      - build
+    if: needs.plan.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Resolve release version
-        id: release
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            version="${{ inputs.version }}"
-          else
-            version="${GITHUB_REF_NAME#v}"
-          fi
-
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-          echo "tag=v${version}" >> "${GITHUB_OUTPUT}"
-
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -148,13 +154,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          tag="${{ steps.release.outputs.tag }}"
-          title="perspective-cuts ${{ steps.release.outputs.version }}"
+          tag="${{ needs.plan.outputs.upstream_tag }}"
+          title="perspective-cuts ${tag}"
+          notes="Build-only release for ${UPSTREAM_REPO} ${tag}.
 
-          if gh release view "${tag}" >/dev/null 2>&1; then
-            gh release upload "${tag}" artifacts/* --clobber
-          else
-            gh release create "${tag}" artifacts/* \
-              --title "${title}" \
-              --notes "Build-only release for taylorarndt/perspective-cuts."
-          fi
+Upstream release: ${{ needs.plan.outputs.upstream_url }}"
+
+          gh release create "${tag}" artifacts/* \
+            --target "${GITHUB_SHA}" \
+            --title "${title}" \
+            --notes "${notes}"
